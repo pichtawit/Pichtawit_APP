@@ -2,6 +2,8 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Page config (16:9 widescreen layout)
 st.set_page_config(
@@ -67,10 +69,27 @@ def fetch_and_process_data(period: str) -> tuple[pd.DataFrame, pd.DataFrame, lis
     return sorted_normalized, summary_df, missing_tickers
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_single_stock_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    """Downloads OHLCV data for a single SET stock and calculates EMA 20 & EMA 50."""
+    df = yf.download(f"{ticker}.BK", period=period, interval=interval, progress=False)
+    if df.empty:
+        return df
+
+    # Flatten MultiIndex columns if returned by newer yfinance versions
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df.dropna(subset=["Close"]).copy()
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    return df
+
+
 # --- Sidebar Controls ---
 st.sidebar.header("Screener Parameters")
 time_period = st.sidebar.selectbox(
-    "Lookback Period",
+    "Screener Lookback Period",
     options=["1mo", "3mo", "6mo", "1y", "2y", "ytd"],
     index=2,  # Default: 6mo
 )
@@ -100,7 +119,7 @@ col2.metric(f"#{top_n} Cutoff", f"{nth_stock['Ticker']}", f"{nth_stock['Return (
 col3.metric(f"Top {top_n} Avg Return", f"{avg_top_return:+.2f}%")
 col4.metric("SET100 Median Return", f"{median_set100_return:+.2f}%")
 
-# Interactive Plotly Line Chart
+# Interactive Plotly Line Chart (Top N Normalized)
 plot_df = top_normalized.reset_index().melt(
     id_vars="Date", var_name="Ticker", value_name="Normalized Ratio"
 )
@@ -116,20 +135,22 @@ fig = px.line(
 
 fig.add_hline(y=1.0, line_dash="dash", line_color="gray", opacity=0.6)
 fig.update_layout(
-    height=550,
+    height=500,
     hovermode="x unified",
     legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
     margin=dict(l=20, r=20, t=50, b=20),
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# Ranked Table & CSV Export
-st.subheader(f"Top {top_n} Ranking & Performance Matrix")
+# --- Interactive Ranked Table (Click row to inspect single stock) ---
+st.subheader(f"Top {top_n} Ranking (คลิกเลือกแถวในตารางเพื่อดูกราฟรายตัว)")
 
-st.dataframe(
+table_event = st.dataframe(
     top_summary,
     use_container_width=True,
     hide_index=True,
+    on_select="rerun",
+    selection_mode="single-row",
     column_config={
         "Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
         "Max Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%"),
@@ -139,6 +160,161 @@ st.dataframe(
     },
 )
 
+# Determine selected ticker (from table click or fallback to dropdown)
+selected_rows = table_event.selection.rows if table_event and table_event.selection else []
+available_tickers = summary_df["Ticker"].tolist()
+
+if selected_rows:
+    default_ticker = top_summary.iloc[selected_rows[0]]["Ticker"]
+else:
+    default_ticker = leader["Ticker"]
+
+st.divider()
+
+# --- Single-Stock Deep-Dive Chart Section ---
+st.subheader("🔍 Individual Stock Chart & Technical View")
+
+ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([2, 2, 2, 2])
+
+with ctrl_col1:
+    selected_ticker = st.selectbox(
+        "Select Ticker (หรือคลิกจากตารางด้านบน)",
+        options=available_tickers,
+        index=available_tickers.index(default_ticker),
+    )
+
+with ctrl_col2:
+    stock_period = st.selectbox(
+        "Chart Timeframe",
+        options=["1mo", "3mo", "6mo", "1y", "2y", "5y", "ytd", "max"],
+        index=3,  # Default: 1y
+    )
+
+with ctrl_col3:
+    stock_interval = st.selectbox(
+        "Candle Interval",
+        options=["1d", "1wk"],
+        index=0,
+    )
+
+with ctrl_col4:
+    chart_type = st.selectbox(
+        "Chart Style",
+        options=["Candlestick", "Line"],
+        index=0,
+    )
+
+with st.spinner(f"Loading {selected_ticker}.BK ({stock_period}, {stock_interval})..."):
+    stock_df = fetch_single_stock_ohlcv(selected_ticker, stock_period, stock_interval)
+
+if not stock_df.empty:
+    # Single-stock KPIs
+    first_close = float(stock_df["Close"].iloc[0])
+    last_close = float(stock_df["Close"].iloc[-1])
+    period_high = float(stock_df["High"].max())
+    period_low = float(stock_df["Low"].min())
+    period_chg = ((last_close / first_close) - 1.0) * 100.0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(f"{selected_ticker} Latest Close", f"฿{last_close:.2f}", f"{period_chg:+.2f}% ({stock_period})")
+    m2.metric(f"{stock_period} High", f"฿{period_high:.2f}")
+    m3.metric(f"{stock_period} Low", f"฿{period_low:.2f}")
+    m4.metric("Latest Volume", f"{int(stock_df['Volume'].iloc[-1]):,}")
+
+    # Build 2-row subplot: Price + EMA (top 75%), Volume (bottom 25%)
+    stock_fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.75, 0.25],
+    )
+
+    if chart_type == "Candlestick":
+        stock_fig.add_trace(
+            go.Candlestick(
+                x=stock_df.index,
+                open=stock_df["Open"],
+                high=stock_df["High"],
+                low=stock_df["Low"],
+                close=stock_df["Close"],
+                name=selected_ticker,
+                increasing_line_color="#00C805",
+                decreasing_line_color="#FF3B30",
+            ),
+            row=1,
+            col=1,
+        )
+    else:
+        stock_fig.add_trace(
+            go.Scatter(
+                x=stock_df.index,
+                y=stock_df["Close"],
+                mode="lines",
+                name="Close Price",
+                line=dict(color="#2962FF", width=2),
+            ),
+            row=1,
+            col=1,
+        )
+
+    # Overlay EMA 20 and EMA 50
+    stock_fig.add_trace(
+        go.Scatter(
+            x=stock_df.index,
+            y=stock_df["EMA20"],
+            mode="lines",
+            name="EMA 20",
+            line=dict(color="#FF9800", width=1.3),
+        ),
+        row=1,
+        col=1,
+    )
+    stock_fig.add_trace(
+        go.Scatter(
+            x=stock_df.index,
+            y=stock_df["EMA50"],
+            mode="lines",
+            name="EMA 50",
+            line=dict(color="#9C27B0", width=1.3),
+        ),
+        row=1,
+        col=1,
+    )
+
+    # Volume bar chart colored by up/down day
+    vol_colors = [
+        "#00C805" if close >= open_ else "#FF3B30"
+        for close, open_ in zip(stock_df["Close"], stock_df["Open"])
+    ]
+    stock_fig.add_trace(
+        go.Bar(
+            x=stock_df.index,
+            y=stock_df["Volume"],
+            name="Volume",
+            marker_color=vol_colors,
+            opacity=0.65,
+        ),
+        row=2,
+        col=1,
+    )
+
+    stock_fig.update_layout(
+        title=f"{selected_ticker}.BK — Price Action & Volume ({stock_period} | {stock_interval})",
+        height=620,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
+    stock_fig.update_yaxes(title_text="Price (THB)", row=1, col=1)
+    stock_fig.update_yaxes(title_text="Volume", row=2, col=1)
+
+    st.plotly_chart(stock_fig, use_container_width=True)
+else:
+    st.warning(f"No historical price data returned for {selected_ticker}.BK.")
+
+# CSV Export
 csv_data = summary_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="Download Full SET100 Ranking (CSV)",
