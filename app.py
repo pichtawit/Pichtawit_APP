@@ -80,7 +80,7 @@ if st.sidebar.button("Refresh Market Data", use_container_width=True):
     st.cache_data.clear()
 
 # --- Main App ---
-st.title("📈 Top SET100 Performers (Normalized to 1.0)")
+st.title("📈 Top SET100 Performers")
 
 with st.spinner(f"Fetching SET100 data ({time_period}) from Yahoo Finance..."):
     sorted_normalized, summary_df, missing_tickers = fetch_and_process_data(time_period)
