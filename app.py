@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from collections import Counter
+import time
 
 # Page config (16:9 widescreen layout)
 st.set_page_config(
@@ -114,29 +115,82 @@ def get_dr_issuer(ticker: str) -> str:
     return "-"
 
 
+def _extract_close_df(raw_df: pd.DataFrame, requested_tickers: list[str]) -> pd.DataFrame:
+    """Safely extracts Close prices regardless of yfinance single/multi-index column format."""
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+
+    if isinstance(raw_df.columns, pd.MultiIndex):
+        if "Close" in raw_df.columns.get_level_values(0):
+            close_df = raw_df["Close"].copy()
+        elif "Close" in raw_df.columns.get_level_values(1):
+            close_df = raw_df.xs("Close", axis=1, level=1).copy()
+        else:
+            return pd.DataFrame()
+    else:
+        if "Close" in raw_df.columns:
+            ticker_name = requested_tickers[0].replace(".BK", "")
+            close_df = raw_df[["Close"]].rename(columns={"Close": ticker_name})
+        else:
+            close_df = raw_df.copy()
+
+    close_df.columns = [str(col).replace(".BK", "") for col in close_df.columns]
+    return close_df
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_and_process_universe(
     tickers: tuple[str, ...], period: str, is_dr: bool = False
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Downloads closing prices for SET100 or DR list, normalizes to 1.0, and builds ranking table."""
-    yf_tickers = [f"{t}.BK" for t in tickers]
-    raw = yf.download(yf_tickers, period=period, progress=False, threads=True)["Close"]
+    """Downloads closing prices in safe batches of 80 tickers to prevent Yahoo Finance timeouts."""
+    chunk_size = 80
+    close_frames = []
 
-    if isinstance(raw, pd.Series):
-        raw = raw.to_frame(name=yf_tickers[0])
+    for i in range(0, len(tickers), chunk_size):
+        batch = tickers[i : i + chunk_size]
+        yf_batch = [f"{t}.BK" for t in batch]
+        try:
+            raw_chunk = yf.download(
+                yf_batch,
+                period=period,
+                progress=False,
+                threads=True,
+                auto_adjust=True,
+            )
+            chunk_close = _extract_close_df(raw_chunk, yf_batch)
+            if not chunk_close.empty:
+                close_frames.append(chunk_close)
+        except Exception:
+            pass
+        if len(tickers) > chunk_size:
+            time.sleep(0.3)
 
-    raw.columns = [col.replace(".BK", "") for col in raw.columns]
+    if not close_frames:
+        return pd.DataFrame(), pd.DataFrame(), list(tickers)
 
-    # Identify tickers with no data
+    raw = pd.concat(close_frames, axis=1)
+    # Remove duplicate columns if any
+    raw = raw.loc[:, ~raw.columns.duplicated()]
+
     downloaded_cols = set(raw.columns)
-    missing_tickers = [t for t in tickers if t not in downloaded_cols or raw[t].isna().all()]
+    missing_tickers = [t for t in tickers if t not in downloaded_cols or raw[t].dropna().shape[0] < 2]
 
-    valid_data = raw.dropna(axis=1, how="all").ffill()
-    if valid_data.empty:
+    # Keep only tickers with at least 2 valid trading days
+    valid_cols = [col for col in raw.columns if raw[col].dropna().shape[0] >= 2]
+    if not valid_cols:
         return pd.DataFrame(), pd.DataFrame(), missing_tickers
 
+    valid_data = raw[valid_cols].ffill()
+
     # Normalize each security to 1.0 at its first valid trading day in the period
-    normalized = valid_data.apply(lambda col: col / col.dropna().iloc[0])
+    normalized_dict = {}
+    for col in valid_data.columns:
+        non_na = valid_data[col].dropna()
+        first_val = float(non_na.iloc[0])
+        if first_val > 0:
+            normalized_dict[col] = valid_data[col] / first_val
+
+    normalized = pd.DataFrame(normalized_dict, index=valid_data.index)
 
     # Sort descending by latest normalized ratio
     latest_ratios = normalized.iloc[-1].dropna().sort_values(ascending=False)
@@ -145,10 +199,10 @@ def fetch_and_process_universe(
     summary_rows = []
     for rank, (ticker, ratio) in enumerate(latest_ratios.items(), start=1):
         series = valid_data[ticker].dropna()
-        start_price = series.iloc[0]
-        end_price = series.iloc[-1]
-        pct_return = (ratio - 1.0) * 100.0
-        max_drawdown = ((series / series.cummax()) - 1.0).min() * 100.0
+        start_price = float(series.iloc[0])
+        end_price = float(series.iloc[-1])
+        pct_return = (float(ratio) - 1.0) * 100.0
+        max_drawdown = float(((series / series.cummax()) - 1.0).min() * 100.0)
 
         row = {
             "Rank": rank,
@@ -158,11 +212,11 @@ def fetch_and_process_universe(
             row["Issuer (ผู้ออก)"] = get_dr_issuer(ticker)
 
         row.update({
-            "Start Price (THB)": round(float(start_price), 2),
-            "Latest Price (THB)": round(float(end_price), 2),
-            "Return (%)": round(float(pct_return), 2),
+            "Start Price (THB)": round(start_price, 2),
+            "Latest Price (THB)": round(end_price, 2),
+            "Return (%)": round(pct_return, 2),
             "Normalized Ratio": round(float(ratio), 4),
-            "Max Drawdown (%)": round(float(max_drawdown), 2),
+            "Max Drawdown (%)": round(max_drawdown, 2),
         })
         summary_rows.append(row)
 
@@ -173,12 +227,19 @@ def fetch_and_process_universe(
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_single_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
     """Downloads OHLCV data for a single ticker and calculates EMA 20 & EMA 50."""
-    df = yf.download(f"{ticker}.BK", period=period, interval=interval, progress=False)
-    if df.empty:
-        return df
+    try:
+        df = yf.download(f"{ticker}.BK", period=period, interval=interval, progress=False)
+    except Exception:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+
+    if "Close" not in df.columns:
+        return pd.DataFrame()
 
     df = df.dropna(subset=["Close"]).copy()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
@@ -189,8 +250,12 @@ def fetch_single_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_security_fundamentals(ticker: str, is_dr: bool = False) -> tuple[dict, pd.DataFrame]:
     """Fetches fundamental ratios and analyzes historical dividend frequency & payout months."""
-    t_obj = yf.Ticker(f"{ticker}.BK")
-    info = t_obj.info or {}
+    try:
+        t_obj = yf.Ticker(f"{ticker}.BK")
+        info = t_obj.info or {}
+    except Exception:
+        t_obj = None
+        info = {}
 
     eps_ttm = info.get("trailingEps")
     eps_fwd = info.get("forwardEps")
@@ -204,7 +269,6 @@ def fetch_security_fundamentals(ticker: str, is_dr: bool = False) -> tuple[dict,
     sector = info.get("sector", "-")
     long_name = info.get("longName") or info.get("shortName") or ticker
 
-    # Trading & 52-week stats (especially useful for DRs)
     wk52_high = info.get("fiftyTwoWeekHigh")
     wk52_low = info.get("fiftyTwoWeekLow")
     avg_vol_10d = info.get("averageDailyVolume10Day") or info.get("averageVolume")
@@ -218,38 +282,40 @@ def fetch_security_fundamentals(ticker: str, is_dr: bool = False) -> tuple[dict,
     div_rate = info.get("dividendRate")
     payout_ratio = info.get("payoutRatio")
 
-    # Analyze historical dividends / distributions (last 5 years)
-    divs = t_obj.dividends
     div_history_df = pd.DataFrame()
     payouts_per_year_str = "ไม่มีประวัติจ่ายปันผล"
     usual_months_str = "-"
     last_xd_str = "-"
 
-    if divs is not None and not divs.empty:
-        divs = divs.sort_index()
-        cutoff_year = pd.Timestamp.now().year - 5
-        recent_divs = divs[divs.index.year >= cutoff_year]
+    try:
+        divs = t_obj.dividends if t_obj is not None else None
+        if divs is not None and not divs.empty:
+            divs = divs.sort_index()
+            cutoff_year = pd.Timestamp.now().year - 5
+            recent_divs = divs[divs.index.year >= cutoff_year]
 
-        if not recent_divs.empty:
-            yearly_counts = recent_divs.groupby(recent_divs.index.year).count()
-            avg_freq = round(yearly_counts.mean(), 1)
-            typical_freq = int(yearly_counts.mode().iloc[0])
-            payouts_per_year_str = f"{typical_freq} ครั้ง/ปี (เฉลี่ย {avg_freq} ครั้ง)"
+            if not recent_divs.empty:
+                yearly_counts = recent_divs.groupby(recent_divs.index.year).count()
+                avg_freq = round(float(yearly_counts.mean()), 1)
+                typical_freq = int(yearly_counts.mode().iloc[0])
+                payouts_per_year_str = f"{typical_freq} ครั้ง/ปี (เฉลี่ย {avg_freq} ครั้ง)"
 
-            month_counts = Counter(recent_divs.index.month)
-            top_months = sorted([m for m, _ in month_counts.most_common(max(typical_freq, 2))])
-            usual_months_str = ", ".join(MONTH_NAMES_TH[m] for m in top_months)
+                month_counts = Counter(recent_divs.index.month)
+                top_months = sorted([m for m, _ in month_counts.most_common(max(typical_freq, 2))])
+                usual_months_str = ", ".join(MONTH_NAMES_TH[m] for m in top_months)
 
-            last_xd_date = recent_divs.index[-1]
-            last_xd_amount = recent_divs.iloc[-1]
-            last_xd_str = f"{last_xd_date.strftime('%d %b %Y')} (฿{last_xd_amount:.4f})"
+                last_xd_date = recent_divs.index[-1]
+                last_xd_amount = float(recent_divs.iloc[-1])
+                last_xd_str = f"{last_xd_date.strftime('%d %b %Y')} (฿{last_xd_amount:.4f})"
 
-            last_10 = recent_divs.tail(10).iloc[::-1]
-            div_history_df = pd.DataFrame({
-                "XD Date": last_10.index.strftime("%Y-%m-%d"),
-                "Month": [MONTH_NAMES_TH[m] for m in last_10.index.month],
-                "Dividend / Unit (THB)": [round(float(v), 4) for v in last_10.values],
-            })
+                last_10 = recent_divs.tail(10).iloc[::-1]
+                div_history_df = pd.DataFrame({
+                    "XD Date": last_10.index.strftime("%Y-%m-%d"),
+                    "Month": [MONTH_NAMES_TH[m] for m in last_10.index.month],
+                    "Dividend / Unit (THB)": [round(float(v), 4) for v in last_10.values],
+                })
+    except Exception:
+        pass
 
     metrics = {
         "company_name": long_name,
@@ -282,50 +348,60 @@ def render_screener_dashboard(
     is_dr: bool = False,
     key_prefix: str = "set100",
 ):
-    """Shared dashboard renderer for both SET100 and DR pages."""
-    st.sidebar.header("Screener Parameters")
-    time_period = st.sidebar.selectbox(
-        "Screener Lookback Period",
-        options=["1mo", "3mo", "6mo", "1y", "2y", "ytd"],
-        index=2,  # Default: 6mo
-        key=f"{key_prefix}_period",
-    )
-    top_n = st.sidebar.slider(
-        "Number of Top Performers",
-        min_value=5,
-        max_value=50,
-        value=20,
-        step=5,
-        key=f"{key_prefix}_top_n",
-    )
+    """Shared dashboard renderer for both SET100 and DR tabs."""
+    ctrl_top1, ctrl_top2, ctrl_top3, ctrl_top4 = st.columns([2, 2, 3, 1.5])
 
-    search_filter = ""
-    if is_dr:
-        search_filter = st.sidebar.text_input(
-            "Filter DR Symbol (เช่น NVDA, AAPL, BABA)",
-            value="",
-            key=f"{key_prefix}_filter",
-        ).strip().upper()
+    with ctrl_top1:
+        time_period = st.selectbox(
+            "Screener Lookback Period",
+            options=["1mo", "3mo", "6mo", "1y", "2y", "ytd"],
+            index=2,  # Default: 6mo
+            key=f"{key_prefix}_period",
+        )
+    with ctrl_top2:
+        top_n = st.slider(
+            "Number of Top Performers",
+            min_value=5,
+            max_value=50,
+            value=20,
+            step=5,
+            key=f"{key_prefix}_top_n",
+        )
+    with ctrl_top3:
+        if is_dr:
+            search_filter = st.text_input(
+                "Filter DR Symbol (เช่น NVDA, AAPL, BABA)",
+                value="",
+                key=f"{key_prefix}_filter",
+            ).strip().upper()
+        else:
+            search_filter = st.text_input(
+                "Filter SET100 Symbol (เช่น DELTA, KBANK)",
+                value="",
+                key=f"{key_prefix}_filter",
+            ).strip().upper()
+    with ctrl_top4:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Refresh Data", use_container_width=True, key=f"{key_prefix}_refresh"):
+            st.cache_data.clear()
+            st.rerun()
 
-    if st.sidebar.button("Refresh Market Data", use_container_width=True, key=f"{key_prefix}_refresh"):
-        st.cache_data.clear()
+    st.subheader(title)
 
-    st.title(title)
-
-    with st.spinner(f"Fetching {len(tickers)} tickers ({time_period}) from Yahoo Finance..."):
+    with st.spinner(f"กำลังโหลดข้อมูล {len(tickers)} หลักทรัพย์ ({time_period}) จาก Yahoo Finance..."):
         sorted_normalized, summary_df, missing_tickers = fetch_and_process_universe(
             tuple(tickers), time_period, is_dr=is_dr
         )
 
     if summary_df.empty:
-        st.error("ไม่สามารถดึงข้อมูลจาก Yahoo Finance ได้ในขณะนี้ กรุณาลองกด Refresh Market Data อีกครั้ง")
+        st.error("ไม่สามารถดึงข้อมูลจาก Yahoo Finance ได้ในขณะนี้ กรุณารอสักครู่แล้วกด Refresh Data")
         return
 
-    # Optional prefix filter for DR page (e.g., compare all NVDA DRs across issuers)
-    if is_dr and search_filter:
+    if search_filter:
         filtered_summary = summary_df[summary_df["Ticker"].str.contains(search_filter, na=False)].copy()
         if filtered_summary.empty:
-            st.warning(f"ไม่พบ DR ที่มีคำว่า '{search_filter}' ในรายชื่อ")
+            st.warning(f"ไม่พบชื่อย่อที่มีคำว่า '{search_filter}'")
             return
         display_summary = filtered_summary.head(top_n)
         display_tickers = display_summary["Ticker"].tolist()
@@ -343,24 +419,26 @@ def render_screener_dashboard(
 
     col1.metric("#1 Performer", f"{leader['Ticker']}", f"{leader['Return (%)']:+.2f}%")
     col2.metric(f"#{len(display_summary)} Cutoff", f"{nth_stock['Ticker']}", f"{nth_stock['Return (%)']:+.2f}%")
-    col3.metric(f"Displayed Avg Return", f"{avg_top_return:+.2f}%")
+    col3.metric("Displayed Avg Return", f"{avg_top_return:+.2f}%")
     col4.metric(
         f"All {'DR' if is_dr else 'SET100'} Median ({len(summary_df)} active)",
         f"{median_universe_return:+.2f}%",
     )
 
     # Interactive Plotly Line Chart (Normalized)
-    plot_df = display_normalized.reset_index().melt(
-        id_vars="Date", var_name="Ticker", value_name="Normalized Ratio"
+    plot_df = display_normalized.reset_index()
+    date_col_name = plot_df.columns[0]
+    plot_melted = plot_df.melt(
+        id_vars=date_col_name, var_name="Ticker", value_name="Normalized Ratio"
     )
 
     fig = px.line(
-        plot_df,
-        x="Date",
+        plot_melted,
+        x=date_col_name,
         y="Normalized Ratio",
         color="Ticker",
         title=f"Top {len(display_summary)} {'DR' if is_dr else 'SET100'} — Normalized Performance ({time_period})",
-        labels={"Normalized Ratio": "Normalized Price Ratio (Start = 1.0)", "Date": ""},
+        labels={"Normalized Ratio": "Normalized Price Ratio (Start = 1.0)", date_col_name: ""},
     )
 
     fig.add_hline(y=1.0, line_dash="dash", line_color="gray", opacity=0.6)
@@ -373,7 +451,7 @@ def render_screener_dashboard(
     st.plotly_chart(fig, use_container_width=True)
 
     # Interactive Ranked Table
-    st.subheader(f"Top {len(display_summary)} Ranking (คลิกเลือกแถวในตารางเพื่อดูกราฟและข้อมูลรายตัว)")
+    st.markdown(f"#### Top {len(display_summary)} Ranking (คลิกเลือกแถวในตารางเพื่อดูกราฟและข้อมูลรายตัว)")
 
     table_event = st.dataframe(
         display_summary,
@@ -391,10 +469,16 @@ def render_screener_dashboard(
         },
     )
 
-    selected_rows = table_event.selection.rows if table_event and table_event.selection else []
+    selected_rows = []
+    try:
+        if table_event and hasattr(table_event, "selection") and table_event.selection:
+            selected_rows = table_event.selection.rows
+    except Exception:
+        selected_rows = []
+
     available_tickers = summary_df["Ticker"].tolist()
 
-    if selected_rows:
+    if selected_rows and selected_rows[0] < len(display_summary):
         default_ticker = display_summary.iloc[selected_rows[0]]["Ticker"]
     else:
         default_ticker = leader["Ticker"]
@@ -402,7 +486,7 @@ def render_screener_dashboard(
     st.divider()
 
     # --- Single-Security Deep-Dive Section ---
-    st.subheader(f"🔍 Individual {'DR' if is_dr else 'Stock'} Chart, Fundamentals & Dividend Profile")
+    st.markdown(f"#### 🔍 Individual {'DR' if is_dr else 'Stock'} Chart, Fundamentals & Dividend Profile")
 
     ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([2, 2, 2, 2])
 
@@ -619,27 +703,23 @@ def render_screener_dashboard(
             st.caption(", ".join(missing_tickers))
 
 
-# --- Multi-Page Navigation Setup ---
-def page_set100():
+# --- Main Header & Top Tabs ---
+st.title("📈 Thai Market Momentum Screener (SET100 & DR)")
+
+tab_set100, tab_dr = st.tabs(["🇹🇭 SET100 Screener", "🌐 DR Screener (386 Tickers)"])
+
+with tab_set100:
     render_screener_dashboard(
-        title="📈 Top SET100 Performers (Normalized to 1.0)",
+        title="Top SET100 Performers (Normalized to 1.0)",
         tickers=SET100_TICKERS,
         is_dr=False,
         key_prefix="set100",
     )
 
-
-def page_dr():
+with tab_dr:
     render_screener_dashboard(
-        title="🌐 Top Thai DR Performers (Normalized to 1.0)",
+        title="Top Thai DR Performers (Normalized to 1.0)",
         tickers=DR_TICKERS,
         is_dr=True,
         key_prefix="dr",
     )
-
-
-pg = st.navigation([
-    st.Page(page_set100, title="SET100 Screener", icon="🇹🇭", default=True),
-    st.Page(page_dr, title="DR Screener (386 Tickers)", icon="🌐"),
-])
-pg.run()
