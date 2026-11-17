@@ -622,7 +622,7 @@ def render_screener_dashboard(
 # --- Multi-Page Navigation Setup ---
 def page_set100():
     render_screener_dashboard(
-        title="📈 Top SET100 Performers (Normalized to 1.0)",
+        title="📈 Top SET100 Performers",
         tickers=SET100_TICKERS,
         is_dr=False,
         key_prefix="set100",
@@ -631,7 +631,7 @@ def page_set100():
 
 def page_dr():
     render_screener_dashboard(
-        title="🌐 Top Thai DR Performers (Normalized to 1.0)",
+        title="🌐 Top Thai DR Performers",
         tickers=DR_TICKERS,
         is_dr=True,
         key_prefix="dr",
@@ -640,6 +640,6 @@ def page_dr():
 
 pg = st.navigation([
     st.Page(page_set100, title="SET100 Screener", icon="🇹🇭", default=True),
-    st.Page(page_dr, title="DR Screener (386 Tickers)", icon="🌐"),
+    st.Page(page_dr, title="DR Screener", icon="🌐"),
 ])
 pg.run()
